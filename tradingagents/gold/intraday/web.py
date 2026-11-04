@@ -42,6 +42,9 @@ DASHBOARD_HTML = Path(__file__).with_name("dashboard.html")
 BOARD_TTL_SECONDS = 15.0
 # The LLM card costs ~4 model calls; one per minute is the sane ceiling.
 LLM_MIN_INTERVAL_SECONDS = 60.0
+# The ICT board is a 1H/15m product: 30 seconds is already faster than its own
+# inputs can change.
+ICT_TTL_SECONDS = 30.0
 
 # Deliverables: every LLM card is appended here so nothing a model said is
 # lost when the page refreshes; daily research reports live in reports/.
@@ -391,6 +394,11 @@ class DashboardState:
         self._error: str = ""
         self._llm_lock = threading.Lock()
         self._llm_at = 0.0
+        # ICT runs on 1H/15m, so it refreshes on a slower clock than the scalp
+        # board and keeps its own cache.
+        self._ict: dict[str, Any] | None = None
+        self._ict_at = 0.0
+        self._ict_error = ""
 
     # -- board ------------------------------------------------------------ #
 
@@ -418,6 +426,27 @@ class DashboardState:
             return payload
 
     # -- llm card ---------------------------------------------------------- #
+
+    def get_ict(self, equity: float | None = None, risk: float | None = None) -> dict[str, Any]:
+        from tradingagents.gold.ict.board import build_ict_board
+
+        eq = equity or self.equity
+        rk = risk or self.risk_pct
+        with self._lock:
+            now = time.time()
+            if self._ict is None or now - self._ict_at > ICT_TTL_SECONDS:
+                try:
+                    self._ict = build_ict_board(equity=eq, risk_pct=rk).to_dict()
+                    self._ict_error = ""
+                except feed.FeedUnavailable as exc:
+                    self._ict_error = str(exc)
+                except Exception as exc:  # noqa: BLE001 — the panel must say why it is blank
+                    self._ict_error = f"{type(exc).__name__}: {exc}"
+                self._ict_at = now
+            payload: dict[str, Any] = {"ict": self._ict}
+            if self._ict_error:
+                payload["error"] = self._ict_error
+            return payload
 
     def run_llm(self, force: bool = False) -> dict[str, Any]:
         from tradingagents.gold.intraday.desk import analyze_scalp
@@ -488,6 +517,11 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                 qs = parse_qs(parsed.query)
                 force = qs.get("force", ["0"])[0] in ("1", "true")
                 self._send(200, json.dumps(state.run_llm(force=force), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            elif parsed.path == "/api/ict":
+                qs = parse_qs(parsed.query)
+                equity = float(qs["equity"][0]) if qs.get("equity") else None
+                risk = float(qs["risk"][0]) if qs.get("risk") else None
+                self._send(200, json.dumps(state.get_ict(equity=equity, risk=risk), ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             elif parsed.path == "/api/cards":
                 limit = int(parse_qs(parsed.query).get("limit", ["30"])[0])
                 self._send(200, json.dumps({"cards": card_history(limit)}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")

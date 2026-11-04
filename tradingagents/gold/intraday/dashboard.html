@@ -176,6 +176,11 @@
 </div>
 
   <div>
+    <div class="card" id="ict-panel">
+      <h2>ICT 模型 <span class="tag">1H 偏置 → 15m 扫单 → 固定 1:2</span></h2>
+      <div id="ict-body"><div class="dim" style="font-size:13px">加载中…</div></div>
+    </div>
+
     <div class="card">
       <h2>交易时钟</h2>
       <table class="kv" id="clock-table"></table>
@@ -466,10 +471,88 @@ $("tab-reports").addEventListener("click", () => {
   loadReports();
 });
 
+// ---------------- ICT 模型：1H 偏置 + 15m 扫单 ----------------
+
+function renderICT(payload) {
+  const box = $("ict-body");
+  if (payload.error && !payload.ict) {
+    box.innerHTML = `<div class="dim" style="font-size:13px">ICT 模型暂不可用：${esc(payload.error)}</div>`;
+    return;
+  }
+  const d = payload.ict;
+  const dirCls = d.bias.direction === "long" ? "long" : d.bias.direction === "short" ? "short" : "watch";
+  const pct = d.bias.position_pct == null ? 50 : Math.max(0, Math.min(100, d.bias.position_pct * 100));
+  const biasLine = `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span class="badge ${dirCls}">${esc(d.bias.label)}</span>
+      <span class="dim" style="font-size:12.5px">结构 ${esc(d.bias.structure)} · 评分 ${d.bias.score}</span>
+      ${d.bias.draw ? `<span class="dim" style="font-size:12.5px">draw → ${esc(d.bias.draw.label)} ${fmt(d.bias.draw.price)}（${d.bias.draw.r}R）</span>` : ""}
+    </div>
+    <div class="gauge" style="height:22px;margin:8px 0 2px"><div class="mid"></div>
+      <div class="needle" style="left:${pct}%;height:32px;top:-5px"></div></div>
+    <div class="gauge-labels"><span>discount（只找多）</span><span>premium（只找空）</span></div>`;
+
+  const range = d.bias.dealing_low != null
+    ? `<div class="dim" style="font-size:12px">Dealing range ${fmt(d.bias.dealing_low)} - ${fmt(d.bias.dealing_high)} · 有效性至 ${(d.bias.valid_until || "").slice(11, 16)}</div>` : "";
+
+  const pools = d.pools.slice(0, 5).map(p => {
+    const above = p.price > d.price;
+    return `<div class="vote-row"><span class="vname" style="min-width:64px">${fmt(p.price)}</span>
+      <span style="flex:1;font-size:12.5px">${esc(p.label)}</span>
+      <span class="${above ? "up" : "down"}" style="font-size:12.5px;min-width:56px;text-align:right">${p.r >= 0 ? "+" : ""}${p.r}R</span></div>`;
+  }).join("");
+
+  const sweeps = d.sweeps.slice(0, 4).map(s => `
+    <div class="vote-row"><span class="vname" style="min-width:64px">${fmt(s.price)}</span>
+      <span style="flex:1;font-size:12.5px">${esc(s.label)} · 扫深 ${fmt(s.pierce)}</span>
+      <span class="badge ${s.reclaimed ? (s.side === "long" ? "long" : "short") : "watch"}" style="font-size:11px">${esc(s.status)}</span></div>`).join("")
+    || `<div class="dim" style="font-size:12.5px">最近 16 根 15m 没有扫单</div>`;
+
+  const setups = d.setups.length ? d.setups.map(s => `
+    <div class="setup ${s.side}" style="margin-top:8px">
+      <div class="head"><span class="badge ${s.side}">${sideCN(s.side)}</span><span class="nm">${esc(s.pool)}</span><span class="dim">评分 ${s.score}</span></div>
+      <div class="kv">
+        <b>入场区</b><span class="big">${fmt(s.entry[0])} - ${fmt(s.entry[1])}</span>
+        <b>止损</b><span class="big ${s.side === "long" ? "down" : "up"}">${fmt(s.stop)}</span>
+        <b>目标</b><span class="big">${fmt(s.targets[0])}（固定 2R）</span>
+        <b>风险</b><span>${fmt(s.risk)} 美元 = ${s.risk_r} ATR · 持有 ${s.hold_minutes} 分钟内</span>
+        <b>依据</b><span class="dim">${esc(s.why)}</span>
+        <b>失效</b><span>${esc(s.invalidation)}</span>
+        ${s.warnings.map(w => `<b>注意</b><span style="color:var(--warn)">${esc(w)}</span>`).join("")}
+      </div>
+    </div>`).join("")
+    : `<div class="scenario" style="margin-top:8px"><div class="row" style="font-size:12.5px">${d.rejects.slice(0, 2).map(r => "· " + esc(r)).join("<br>")}</div></div>`;
+
+  box.innerHTML = biasLine + range +
+    `<h2 style="margin-top:12px;font-size:13px">流动性池 <span class="tag">上方=买方流动性，下方=卖方流动性</span></h2>` + pools +
+    `<h2 style="margin-top:12px;font-size:13px">15m 扫单监视</h2>` + sweeps +
+    `<h2 style="margin-top:12px;font-size:13px">扫单入场</h2>` + setups +
+    `<div class="dim" style="font-size:11.5px;margin-top:8px">数据 ${esc(d.source || "")} · ${minsH(d.bar_age_minutes)} 前${d.stale ? " · 延迟" : ""}${d.freshness_blocker ? " · " + esc(d.freshness_blocker) : ""}</div>`;
+}
+
+let ictTick = 0;
+async function fetchICT() {
+  const params = new URLSearchParams();
+  if ($("equity").value) params.set("equity", $("equity").value);
+  if ($("risk").value) params.set("risk", $("risk").value);
+  try {
+    const res = await fetch("/api/ict?" + params.toString(), { cache: "no-store" });
+    renderICT(await res.json());
+  } catch (e) {
+    $("ict-body").innerHTML = `<div class="dim" style="font-size:13px">ICT 模型加载失败：${esc(e.message)}</div>`;
+  }
+}
+
 function tick() {
   countdown -= 1;
   $("refresh-info").textContent = countdown <= 0 ? "刷新中…" : `${countdown}s 后刷新`;
-  if (countdown <= 0) { countdown = REFRESH_SECONDS; fetchBoard(); }
+  if (countdown <= 0) {
+    countdown = REFRESH_SECONDS;
+    fetchBoard();
+    // ICT runs on 1H/15m: every other board refresh is already generous.
+    ictTick = (ictTick + 1) % 2;
+    if (ictTick === 0) fetchICT();
+  }
 }
 
 $("llm-run").addEventListener("click", runLLM);
@@ -481,6 +564,7 @@ if (!$("equity").value) $("equity").value = 50000;
 if (!$("risk").value) $("risk").value = 0.3;
 
 fetchBoard();
+fetchICT();
 loadCards();
 setInterval(tick, 1000);
 </script>

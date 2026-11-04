@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from tradingagents.gold.config import GOLD_ANALYSTS, gold_config, gold_home
+from tradingagents.gold.ict.cli import ICT_HELP, ict_command
 from tradingagents.gold.intraday.cli import DASHBOARD_HELP, SCALP_HELP, dashboard_command, scalp_command
 from tradingagents.gold.spec import GOLD_SYMBOL, NotGoldError, resolve_gold_symbol
 
@@ -32,6 +33,7 @@ app = typer.Typer(
 )
 app.command("scalp", help=SCALP_HELP)(scalp_command)
 app.command("dashboard", help=DASHBOARD_HELP)(dashboard_command)
+app.command("ict", help=ICT_HELP)(ict_command)
 console = Console()
 
 # Chinese market convention: up / bullish is red, down / bearish is green.
