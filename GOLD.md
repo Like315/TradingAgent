@@ -373,3 +373,32 @@ git fetch upstream
 git merge upstream/main      # 冲突基本只会出现在 setup.py / analyst_execution.py 的注册段
 .venv/Scripts/python.exe -m pytest tests -q
 ```
+
+---
+
+## 12. Web 看板与一键启动
+
+```bash
+# Windows：双击仓库根目录的 start.bat 即可（首次会自动建 .venv 并装依赖）
+start.bat
+start.bat --port 8689 --equity 20000 --risk 0.25
+```
+
+```bash
+# 任意平台
+.venv/Scripts/python.exe -m tradingagents.gold.cli dashboard --equity 50000 --risk 0.3
+```
+
+打开 `http://127.0.0.1:8686`（用 `--port` 改）。页面 20 秒自动刷新，包含：
+
+| 区块 | 内容 | 数据来源 |
+|---|---|---|
+| 顶栏 | 现价、涨跌、时段/流动性、数据新鲜度 | 东财 → 新浪 → 缓存 |
+| 方向辅助判断 | 5 张算术投票加权成 −1~+1 的方向分 | 纯计算，不调模型 |
+| 日内交易计划 | 关键位、上破/下破情景、事件表、纪律红线 | 纯计算 |
+| 剥头皮形态卡 | 可执行形态 + 仓位换算 + “为什么不做” | 纯计算 |
+| ICT 模型 | 1H 偏置、流动性池、15m 扫单监视、固定 2R | 纯计算 |
+| 模型深度研判 | 四角色模型出卡，止损与板面不符会被否决 | 需手动点击（约 4 次调用） |
+| 分析产出 | 研判卡历史 + 日线研究报告库 | `~/.tradingagents/gold/logs/` |
+
+看板只做**辅助判断**，不下单、不接管账户；`--llm` 相关功能需要 `.env` 里的 API key。
