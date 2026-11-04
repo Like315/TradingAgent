@@ -44,6 +44,9 @@ bedrock = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
+# Gold-only desk: locked to GC=F/XAUUSD with the gold analyst set. See
+# tradingagents/gold/ and docs/gold-desk.md.
+tradingagents-gold = "tradingagents.gold.cli:app"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}

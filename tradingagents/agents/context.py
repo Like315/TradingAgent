@@ -166,7 +166,40 @@ def build_instrument_context(
             " Treat it as a crypto asset rather than a company, and do not "
             "assume company fundamentals are available."
         )
+
+    # A profile can append its own domain briefing here (the gold desk does: no
+    # cash flow, real yields as the discount rate, ATR-based sizing). It is
+    # appended rather than substituted so the identity guarantees above survive
+    # whatever a profile adds.
+    note = (_config_note() or "").strip()
+    if note:
+        context += "\n\n" + note
     return context
+
+
+def _config_note() -> str:
+    from tradingagents.dataflows.config import get_config
+
+    return get_config().get("instrument_context_note") or ""
+
+
+def report_slot_label(slot: str, default: str) -> str:
+    """Display name for a report slot, from the active profile's label map.
+
+    The gold desk fills the ``fundamentals_report`` slot with a macro report, so
+    a downstream prompt that says "Company Fundamentals Report:" would mislabel
+    it. Profiles override the labels; the state keys stay upstream-compatible.
+    """
+    from tradingagents.dataflows.config import get_config
+
+    return (get_config().get("report_slot_labels") or {}).get(slot, default)
+
+
+def analyst_title(key: str, default: str) -> str:
+    """Display name for an analyst key, from the active profile's title map."""
+    from tradingagents.dataflows.config import get_config
+
+    return (get_config().get("analyst_titles") or {}).get(key, default)
 
 
 def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:

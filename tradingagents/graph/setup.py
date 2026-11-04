@@ -22,6 +22,7 @@ from tradingagents.agents import (
 )
 from tradingagents.agents.analysts.turn import WRAP_UP
 from tradingagents.agents.state import AgentState
+from tradingagents.dataflows.config import get_config
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
@@ -129,15 +130,33 @@ class GraphSetup:
             "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
         }
 
-        bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
-        bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
-        research_manager_node = create_research_manager(self.deep_thinking_llm)
-        trader_node = create_trader(self.quick_thinking_llm)
+        # A gold run swaps the equity-framed agents for the gold ones. The
+        # analysts are keyed separately (gold_market/gold_macro/...), while the
+        # debate, trader and risk nodes keep their upstream names and edges so
+        # the graph topology is identical — only the prompts and tools differ.
+        if get_config().get("gold_mode"):
+            from tradingagents.gold.agents import build_gold_debate_nodes, gold_analyst_factories
 
-        aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
-        conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+            analyst_factories.update(gold_analyst_factories(self.quick_thinking_llm))
+            gold_nodes = build_gold_debate_nodes(self.quick_thinking_llm, self.deep_thinking_llm)
+            bull_researcher_node = gold_nodes["bull"]
+            bear_researcher_node = gold_nodes["bear"]
+            research_manager_node = gold_nodes["manager"]
+            trader_node = gold_nodes["trader"]
+            aggressive_analyst = gold_nodes["aggressive"]
+            neutral_analyst = gold_nodes["neutral"]
+            conservative_analyst = gold_nodes["conservative"]
+            portfolio_manager_node = gold_nodes["pm"]
+        else:
+            bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
+            bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
+            research_manager_node = create_research_manager(self.deep_thinking_llm)
+            trader_node = create_trader(self.quick_thinking_llm)
+
+            aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
+            neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
+            conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
+            portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
 
         workflow = StateGraph(AgentState)
 

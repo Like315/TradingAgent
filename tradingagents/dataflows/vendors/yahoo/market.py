@@ -10,7 +10,12 @@ from stockstats import wrap
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
-from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
+from tradingagents.dataflows.vendors.yahoo.ohlcv import (
+    _assert_ohlcv_not_stale,
+    domestic_frame,
+    gold_price_source as _gold_price_source,
+    load_ohlcv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +36,42 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
+
+    # Same source policy as ``load_ohlcv``: a run configured for the domestic
+    # feed must not pay Yahoo's timeout here either, and a Yahoo failure on a
+    # symbol the domestic feed covers is served from there instead of costing
+    # the analyst its price series.
+    data, yahoo_error = None, None
+    if _gold_price_source() not in ("domestic", "eastmoney"):
+        try:
+            data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
+        except Exception as exc:  # noqa: BLE001 — try the fallback before failing
+            yahoo_error = exc
+    if data is None or data.empty:
+        data = domestic_frame(canonical, end_date)
 
     # Empty result means the symbol is unknown/delisted. Raise a typed error
     # instead of returning prose: the routing layer turns it into a single
     # unambiguous "no data" signal so the agent never fabricates a price.
     if data is None or data.empty:
+        if yahoo_error is not None:
+            raise yahoo_error
         raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+
+    if "Date" in data.columns:  # the domestic frames carry the date as a column
+        data = data.set_index(pd.DatetimeIndex(pd.to_datetime(data["Date"]))).drop(columns=["Date"])
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
+
+    # The domestic source returns its whole history (5 years); the caller asked
+    # for a window, and dumping 1250 rows into the model's context would bury
+    # the rows actually requested. Yahoo's frame is already inside the range, so
+    # this is a no-op there.
+    window = data[(data.index >= pd.Timestamp(start_date)) & (data.index <= pd.Timestamp(end_date))]
+    if not window.empty:
+        data = window
 
     # Reject a stale frame (e.g. a year-old partial response) before it is
     # formatted into the report. Raises NoMarketDataError, which the router

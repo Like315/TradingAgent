@@ -9,12 +9,19 @@ run produces the same on-disk report tree a CLI run does.
 from datetime import datetime
 from pathlib import Path
 
+from tradingagents.agents.context import analyst_title, report_slot_label
 from tradingagents.agents.rating import run_rating
 
 
 def analyst_names(keys) -> list[str]:
     """The analysts as users select them: the sentiment analyst's key is "social"."""
-    return ["sentiment" if key == "social" else key for key in keys or []]
+    names = []
+    for key in keys or []:
+        # A gold run selects gold_market/gold_macro/…; show the profile's title
+        # so the report header reads "Gold Macro Analyst", not an internal key.
+        default = "sentiment" if key == "social" else key
+        names.append(analyst_title(key, default))
+    return names
 
 
 def _header(ticker: str, final_state: dict, settings: dict | None) -> str:
@@ -83,10 +90,27 @@ def _report_parts(final_state: dict) -> list[tuple[str, str, list[tuple[str, str
             for key in path:
                 value = (value or {}).get(key)
             if value:
-                written.append((agent, filename, value))
+                written.append((_agent_label(folder, filename, agent), filename, value))
         if written:
             parts.append((heading, folder, written))
     return parts
+
+
+# The analyst report files keep their upstream names (a profile reuses the same
+# state slots), so the visible name is looked up by slot instead of by filename.
+_ANALYST_FILE_SLOTS = {
+    "market.md": "market_report",
+    "sentiment.md": "sentiment_report",
+    "news.md": "news_report",
+    "fundamentals.md": "fundamentals_report",
+}
+
+
+def _agent_label(folder: str, filename: str, default: str) -> str:
+    if folder != "1_analysts":
+        return default
+    slot = _ANALYST_FILE_SLOTS.get(filename)
+    return report_slot_label(slot, default) if slot else default
 
 
 def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict | None = None,

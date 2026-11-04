@@ -2,6 +2,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from tradingagents.agents.analysts import fundamentals_analyst, market_analyst, news_analyst
+from tradingagents.gold.analysts import (
+    GOLD_MACRO_TOOLS,
+    GOLD_MARKET_TOOLS,
+    GOLD_NEWS_TOOLS,
+    GOLD_POSITIONING_TOOLS,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,35 @@ ANALYST_NODE_SPECS: dict[str, AnalystNodeSpec] = {
         agent_node="Fundamentals Analyst",
         report_key="fundamentals_report",
         tools=fundamentals_analyst.TOOLS,
+    ),
+    # --- gold desk ---------------------------------------------------------
+    # The gold analysts write into the same report keys the rest of the graph
+    # already reads (market/fundamentals/sentiment/news), so the debate, trader,
+    # risk team and report writer need no gold-specific branch: only the prompt
+    # and the tools behind each slot differ. See tradingagents/gold/.
+    "gold_market": AnalystNodeSpec(
+        key="gold_market",
+        agent_node="Gold Market Analyst",
+        report_key="market_report",
+        tools=GOLD_MARKET_TOOLS,
+    ),
+    "gold_macro": AnalystNodeSpec(
+        key="gold_macro",
+        agent_node="Gold Macro Analyst",
+        report_key="fundamentals_report",
+        tools=GOLD_MACRO_TOOLS,
+    ),
+    "gold_positioning": AnalystNodeSpec(
+        key="gold_positioning",
+        agent_node="Gold Flows Analyst",
+        report_key="sentiment_report",
+        tools=GOLD_POSITIONING_TOOLS,
+    ),
+    "gold_news": AnalystNodeSpec(
+        key="gold_news",
+        agent_node="Gold News Analyst",
+        report_key="news_report",
+        tools=GOLD_NEWS_TOOLS,
     ),
 }
 

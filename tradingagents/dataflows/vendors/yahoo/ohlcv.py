@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -22,6 +23,12 @@ MAX_OHLCV_STALE_DAYS = 10
 # up today's close soon after it publishes, long enough that a day with no bar
 # at all (weekend, holiday) cannot trigger a download on every call.
 OHLCV_CACHE_TTL_SECONDS = 900
+
+# After a failure, a symbol's error is remembered for this long in the current
+# process so a run does not pay the vendor's timeout on every tool call. It is
+# retried after the window, and on the next run.
+_YF_COOLDOWN_SECONDS = 600
+_YF_FAILED: dict[str, tuple[float, Exception]] = {}
 
 
 def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
@@ -158,6 +165,125 @@ def _cache_is_fresh(data_file, as_of_dt, now) -> bool:
     return as_of_dt.date() < now.date() or (now - written).total_seconds() <= OHLCV_CACHE_TTL_SECONDS
 
 
+def gold_price_source() -> str:
+    """Where prices come from for this run: ``domestic``, ``auto`` or ``yahoo``.
+
+    Read from the active config so every price path — the OHLCV loader, the
+    online stock tool, the indicator window — agrees on one policy instead of
+    each deciding on its own whether to pay Yahoo's timeout.
+    """
+    return str(get_config().get("gold_price_source") or "auto").lower()
+
+
+def domestic_frame(canonical: str, end_str: str) -> pd.DataFrame | None:
+    """The China-reachable series for ``canonical`` (public name for the fallback)."""
+    return _domestic_fallback(canonical, end_str)
+
+
+def _download_or_fallback(
+    canonical: str, symbol: str, start_str: str, end_str: str, data_file: str
+) -> pd.DataFrame:
+    """Yahoo first, then the China-reachable gold source; caches whatever answered.
+
+    Yahoo is the framework's price vendor, but it is intermittently unreachable
+    from mainland networks, and a gold desk whose only series is gold needs *a*
+    price far more than it needs a particular vendor. ``tradingagents.gold``
+    supplies the fallback for the handful of symbols it covers (COMEX gold, the
+    dollar index, USD/CNH, SHFE gold); everything else still fails loudly.
+    """
+    downloaded = None
+    yahoo_error: Exception | None = None
+    source = gold_price_source()
+    # "domestic" (or the older "eastmoney" spelling) skips Yahoo outright: a run
+    # behind a network where Yahoo is filtered would otherwise pay its timeout on
+    # the first call and learn nothing.
+    use_yahoo = source not in ("domestic", "eastmoney")
+
+    # A symbol that just failed keeps its error for a while: re-paying the
+    # timeout on every tool call would turn one unreachable vendor into minutes
+    # of stalls per run. Only symbols the domestic fallback covers get this
+    # treatment — for everything else Yahoo is the only source, so its retry
+    # behaviour is left exactly as upstream.
+    covered = _domestic_covers(canonical)
+    last_failure = _YF_FAILED.get(canonical) if covered else None
+    if last_failure and time.monotonic() - last_failure[0] > _YF_COOLDOWN_SECONDS:
+        _YF_FAILED.pop(canonical, None)
+        last_failure = None
+    if last_failure is not None:
+        yahoo_error = last_failure[1]
+
+    if use_yahoo and last_failure is None:
+        try:
+            # yf.download catches every error, a rate limit included, and returns
+            # an empty frame. Ticker.history raises the rate limit, so it is retried.
+            downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
+                start=start_str,
+                end=end_str,
+                auto_adjust=True,
+                actions=False,
+            ))
+            _YF_FAILED.pop(canonical, None)
+        except Exception as exc:  # noqa: BLE001 — try the fallback before failing
+            yahoo_error = exc
+            if covered:
+                _YF_FAILED[canonical] = (time.monotonic(), exc)
+            logger.warning(
+                "yfinance unavailable for %s (%s); trying the fallback source.",
+                canonical, exc,
+            )
+
+    if downloaded is None or downloaded.empty or "Close" not in downloaded.columns:
+        fallback = _domestic_fallback(canonical, end_str)
+        if fallback is not None and not fallback.empty:
+            logger.info("Served %s from the domestic fallback source", canonical)
+            downloaded = fallback
+
+    if downloaded is None:
+        # Neither source answered. Re-raise Yahoo's own error when there was one:
+        # the router's messaging and the tests that pin it distinguish "the
+        # vendor failed" from "the symbol has no data".
+        if yahoo_error is not None:
+            raise yahoo_error
+        raise_for_empty(symbol, canonical, "price rows")
+    downloaded = _ensure_date_column(downloaded.reset_index() if "Date" not in downloaded.columns else downloaded)
+    # Only cache real data — never persist an empty frame.
+    if downloaded.empty or "Close" not in downloaded.columns:
+        raise_for_empty(symbol, canonical, "price rows")
+    replace_file(data_file, lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"))
+    return downloaded
+
+
+def _domestic_covers(canonical: str) -> bool:
+    """Whether a China-reachable source can serve this symbol at all."""
+    try:
+        from tradingagents.gold.vendors import eastmoney, sina
+
+        return canonical in eastmoney.SECIDS or canonical in sina.SYMBOLS
+    except Exception:  # noqa: BLE001 — no fallback module, no fallback behaviour
+        return False
+
+
+def _domestic_fallback(canonical: str, end_str: str) -> pd.DataFrame | None:
+    """The gold desk's backup price sources, in order; None when none covers the symbol.
+
+    Eastmoney first (it carries volume, which the flow proxy uses), then Sina
+    (a different host, so one host's rate limit is not the desk going blind).
+    """
+    for module_name in ("eastmoney", "sina"):
+        try:
+            module = __import__(
+                f"tradingagents.gold.vendors.{module_name}", fromlist=[module_name]
+            )
+            frame = module.ohlcv(canonical, as_of=end_str)
+        except Exception as exc:  # noqa: BLE001 — a fallback must never be the reason a run dies
+            logger.debug("Domestic fallback %s unavailable for %s: %s", module_name, canonical, exc)
+            continue
+        if frame is not None and not frame.empty:
+            logger.info("Served %s from the domestic fallback source (%s)", canonical, module_name)
+            return frame
+    return None
+
+
 def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -207,22 +333,7 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
             data = cached
 
     if data is None:
-        # yf.download catches every error, a rate limit included, and returns
-        # an empty frame. Ticker.history raises the rate limit, so it is retried.
-        downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
-            start=start_str,
-            end=end_str,
-            auto_adjust=True,
-            actions=False,
-        ))
-        if downloaded is None:
-            raise_for_empty(symbol, canonical, "price rows")
-        downloaded = _ensure_date_column(downloaded.reset_index())
-        # Only cache real data — never persist an empty frame.
-        if downloaded.empty or "Close" not in downloaded.columns:
-            raise_for_empty(symbol, canonical, "price rows")
-        replace_file(data_file, lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"))
-        data = downloaded
+        data = _download_or_fallback(canonical, symbol, start_str, end_str, data_file)
 
     data = _clean_dataframe(data)
 
