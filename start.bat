@@ -52,7 +52,13 @@ if not exist ".env" (
   echo [warn] will fail until you add OPENAI_API_KEY / DEEPSEEK key there.
   echo.
 )
-echo [run] Dashboard:  http://127.0.0.1:8686
+rem Only quote the default URL when no flags were given: a custom --port
+rem would otherwise be mislabelled here.
+if "%~1"=="" (
+  echo [run] Dashboard:  http://127.0.0.1:8686
+) else (
+  echo [run] Starting dashboard with your flags ^(URL below^)...
+)
 echo [run] Press Ctrl+C or close this window to stop the server.
 echo.
 "%GOLDEXE%" dashboard %*
