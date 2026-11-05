@@ -963,3 +963,93 @@ def test_report_library_reads_only_inside_reports_dir(tmp_path, monkeypatch):
     assert "error" in web.read_report("..", "secret.txt")
     assert "error" in web.read_report("GC=F_20261029_231852", "../../secret.txt")
     assert "error" in web.read_report("GC=F_20261029_231852", "nope.md")
+
+
+def test_day_plan_target_always_lies_beyond_its_trigger():
+    """Regression: the map is display-ordered, so the plan once inverted.
+
+    A breakout above a level must target something higher, and a breakdown
+    below a level must target something lower -- otherwise the card tells you
+    to buy with a target under your entry.
+    """
+    data = {
+        "price": 4136.5,
+        "clock": {"tradable": False, "blockers": [], "phase": "欧洲盘前", "grade": "C", "next_marks": [], "blackout": None},
+        "regime": {"code": "range", "label": "区间", "bias": 0.5, "ema_align": "多头排列", "dist_vwap_sigma": 0.6, "rv_1h_pct": 24.0, "atr_expansion": 1.4},
+        "levels": {
+            "vwap": 4122.2,
+            "vwap_sigma": 22.5,
+            "atr5": 5.7,
+            "atr15": 10.6,
+            "map": [
+                # deliberately in the order levels.py emits (display order)
+                {"name": "4,175", "price": 4175.0, "distance": 38.5, "atr": 6.7},
+                {"name": "VWAP +2σ", "price": 4167.3, "distance": 30.8, "atr": 5.4},
+                {"name": "当日高", "price": 4155.8, "distance": 19.3, "atr": 3.4},
+                {"name": "4,150", "price": 4150.0, "distance": 13.5, "atr": 2.4},
+                {"name": "VWAP +1σ", "price": 4144.7, "distance": 8.2, "atr": 1.4},
+                {"name": "波段高 14:25", "price": 4140.6, "distance": 4.1, "atr": 0.7},
+                {"name": "波段高 13:45", "price": 4135.4, "distance": -1.1, "atr": -0.2},
+                {"name": "波段低 14:40", "price": 4130.4, "distance": -6.1, "atr": -1.1},
+                {"name": "4,125", "price": 4125.0, "distance": -11.5, "atr": -2.0},
+                {"name": "VWAP -2σ", "price": 4077.2, "distance": -59.3, "atr": -10.4},
+            ],
+        },
+        "setups": [],
+        "no_trade_reasons": ["时段不允许开仓：流动性 C 级"],
+    }
+    from tradingagents.gold.intraday.web import build_day_plan
+
+    plan = build_day_plan(data)
+    long_scn = next(s for s in plan["scenarios"] if s["side"] == "long")
+    short_scn = next(s for s in plan["scenarios"] if s["side"] == "short")
+
+    assert "4,140.60" in long_scn["trigger"], long_scn["trigger"]  # nearest above, not the farthest
+    assert "4,150.00" in long_scn["targets"], long_scn["targets"]  # >=1.2R beyond, still above it
+    assert "4,135.40" in short_scn["trigger"], short_scn["trigger"]  # nearest below, even if it is a former high
+    assert "4,125.00" in short_scn["targets"], short_scn["targets"]
+
+
+def test_day_plan_target_always_lies_beyond_its_trigger():
+    """Regression: the map is display-ordered, so the plan once inverted.
+
+    A breakout above a level must target something higher, and a breakdown
+    below a level must target something lower -- otherwise the card tells you
+    to buy with a target under your entry.
+    """
+    data = {
+        "price": 4136.5,
+        "clock": {"tradable": False, "blockers": [], "phase": "欧洲盘前", "grade": "C", "next_marks": [], "blackout": None},
+        "regime": {"code": "range", "label": "区间", "bias": 0.5, "ema_align": "多头排列", "dist_vwap_sigma": 0.6, "rv_1h_pct": 24.0, "atr_expansion": 1.4},
+        "levels": {
+            "vwap": 4122.2,
+            "vwap_sigma": 22.5,
+            "atr5": 5.7,
+            "atr15": 10.6,
+            "map": [
+                # deliberately in the order levels.py emits (display order)
+                {"name": "4,175", "price": 4175.0, "distance": 38.5, "atr": 6.7},
+                {"name": "VWAP +2σ", "price": 4167.3, "distance": 30.8, "atr": 5.4},
+                {"name": "当日高", "price": 4155.8, "distance": 19.3, "atr": 3.4},
+                {"name": "4,150", "price": 4150.0, "distance": 13.5, "atr": 2.4},
+                {"name": "VWAP +1σ", "price": 4144.7, "distance": 8.2, "atr": 1.4},
+                {"name": "波段高 14:25", "price": 4140.6, "distance": 4.1, "atr": 0.7},
+                {"name": "波段高 13:45", "price": 4135.4, "distance": -1.1, "atr": -0.2},
+                {"name": "波段低 14:40", "price": 4130.4, "distance": -6.1, "atr": -1.1},
+                {"name": "4,125", "price": 4125.0, "distance": -11.5, "atr": -2.0},
+                {"name": "VWAP -2σ", "price": 4077.2, "distance": -59.3, "atr": -10.4},
+            ],
+        },
+        "setups": [],
+        "no_trade_reasons": ["时段不允许开仓：流动性 C 级"],
+    }
+    from tradingagents.gold.intraday.web import build_day_plan
+
+    plan = build_day_plan(data)
+    long_scn = next(s for s in plan["scenarios"] if s["side"] == "long")
+    short_scn = next(s for s in plan["scenarios"] if s["side"] == "short")
+
+    assert "4,140.60" in long_scn["trigger"], long_scn["trigger"]  # nearest above, not the farthest
+    assert "4,150.00" in long_scn["targets"], long_scn["targets"]  # >=1.2R beyond, still above it
+    assert "4,135.40" in short_scn["trigger"], short_scn["trigger"]  # nearest below, even if it is a former high
+    assert "4,125.00" in short_scn["targets"], short_scn["targets"]

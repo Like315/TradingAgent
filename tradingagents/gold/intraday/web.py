@@ -172,15 +172,31 @@ def build_day_plan(data: dict[str, Any]) -> dict[str, Any]:
     price = data["price"]
     map_rows = levels["map"]
 
-    above = [lv for lv in map_rows if lv["price"] > price]
-    below = [lv for lv in map_rows if lv["price"] <= price]
+    # The level map is ordered for display, not by price, so rank each side
+    # explicitly here. Getting this wrong silently inverts the plan: a
+    # breakout above 4,175 whose "target" is 4,167 below it.
+    above = sorted((lv for lv in map_rows if lv["price"] > price), key=lambda lv: lv["price"])
+    below = sorted((lv for lv in map_rows if lv["price"] <= price), key=lambda lv: -lv["price"])
     nearest_above = above[0] if above else None
-    nearest_below = below[-1] if below else None
-    far_above = above[1] if len(above) > 1 else None
-    far_below = below[-2] if len(below) > 1 else None
+    nearest_below = below[0] if below else None
+
+    # A target has to be worth the stop: from the breakout entry, insist on at
+    # least MIN_SCENARIO_R beyond it, otherwise the scenario is a coin flip.
+    unit = levels.get("atr5") or 1.0
+    min_r = 1.2
+
+    def _beyond(rows: list[dict[str, Any]], ref: dict[str, Any], direction: int) -> dict[str, Any] | None:
+        need = ref["price"] + direction * min_r * unit
+        for row in rows:
+            if (row["price"] - need) * direction >= 0:
+                return row
+        return None
+
+    far_above = _beyond(above, nearest_above, 1) if nearest_above else None
+    far_below = _beyond(below, nearest_below, -1) if nearest_below else None
 
     key_levels: list[dict[str, Any]] = []
-    for lv in map_rows[:8]:
+    for lv in sorted(map_rows, key=lambda lv: abs(lv.get("distance") or 0))[:8]:
         key_levels.append(
             {"price": lv["price"], "name": lv["name"], "distance": lv.get("distance"), "atr": lv.get("atr"), "note": lv.get("note") or ""}
         )
@@ -266,9 +282,15 @@ def build_day_plan(data: dict[str, Any]) -> dict[str, Any]:
         events.insert(0, {"in_minutes": bo["minutes"], "label": ("【事件窗口】" if bo["active"] else "") + bo["label"], "at": ""})
 
     asian = levels.get("asian_high") and levels.get("asian_low")
-    plan_notes = [
-        f"今日波动预算：20 日均幅对应的当日已走 {regime['rv_1h_pct']:.0f}%（1h 实际波动），ATR 扩张 {regime['atr_expansion']:.2f}x"
-    ]
+    # Tolerate a thin regime dict: this block must never take the whole
+    # endpoint down over one missing diagnostic field.
+    rv = regime.get("rv_1h_pct")
+    expansion = regime.get("atr_expansion")
+    note = "今日波动预算："
+    note += f"1 小时实际波动 {rv:.0f}%" if rv is not None else "1 小时实际波动 未知"
+    if expansion is not None:
+        note += f"，ATR 扩张 {expansion:.2f}x"
+    plan_notes = [note]
     if asian:
         plan_notes.append(
             f"亚洲区间 {levels['asian_low']:,.2f}-{levels['asian_high']:,.2f}"
