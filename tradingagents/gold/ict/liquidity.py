@@ -32,6 +32,8 @@ MIN_PIERCE_ATR = 0.08
 APPROACH_ATR = 0.25
 # Pools further than this are context, not triggers.
 MAX_POOL_ATR = 12.0
+# Session extremes (Asian/London/NY walls) carry more stops than a lone swing.
+SESSION_KINDS = {"session_asian", "session_extreme"}
 
 BUY_SIDE = "buy_side"   # stops above the market: swept → bearish
 SELL_SIDE = "sell_side"  # stops below the market: swept → bullish
@@ -104,7 +106,7 @@ def _cluster(prices: Iterable[float], tol: float, pick: str) -> list[tuple[float
     return out
 
 
-def find_pools(ctx) -> list[Pool]:
+def find_pools(ctx, sessions=None) -> list[Pool]:
     """Every pool the trigger frame can act on, above and below the price."""
     tol = max(POOL_TOL_ATR * ctx.atr, 0.3)
     pools: list[Pool] = []
@@ -133,7 +135,36 @@ def find_pools(ctx) -> list[Pool]:
             )
         )
 
-    # 2. Equal highs / equal lows — the pools ICT traders actually wait for.
+    # 2. Session walls from the SMC layer. Asian extremes already arrive via
+    #    the level map; London and New York ranges do not, and their highs and
+    #    lows are exactly where stops pile up once a session completes.
+    if sessions is not None:
+        for rng, tag in ((sessions.london, "伦敦"), (sessions.new_york, "纽约")):
+            if rng.high is None:
+                continue
+            suffix = "" if rng.complete else "（进行中）"
+            state = "已破转支撑" if rng.high <= ctx.price else "买方流动性"
+            pools.append(
+                Pool(
+                    price=rng.high,
+                    kind="session_extreme",
+                    label=f"{tag}时段高{suffix}·{state}",
+                    side=side_of(rng.high),
+                    touches=1,
+                )
+            )
+            state = "已破转阻力" if rng.low >= ctx.price else "卖方流动性"
+            pools.append(
+                Pool(
+                    price=rng.low,
+                    kind="session_extreme",
+                    label=f"{tag}时段低{suffix}·{state}",
+                    side=side_of(rng.low),
+                    touches=1,
+                )
+            )
+
+    # 3. Equal highs / equal lows — the pools ICT traders actually wait for.
     points = swings(ctx.bars15, k=2, lookback=160)
     highs = [p for side, p, _ in points if side == "high"]
     lows = [p for side, p, _ in points if side == "low"]
@@ -148,7 +179,7 @@ def find_pools(ctx) -> list[Pool]:
         label = f"等低·卖方流动性（{touches} 触）" if below else f"等低·已破转阻力（{touches} 触）"
         pools.append(Pool(price=price, kind="equal_lows", label=label, side=side_of(price), touches=touches))
 
-    # 3. Collapse duplicates: one wall, one entry. Only same-side pools merge —
+    # 4. Collapse duplicates: one wall, one entry. Only same-side pools merge —
     # a level above and below price are different trades even at the same price.
     pools = [p for p in pools if abs(p.price - ctx.price) <= MAX_POOL_ATR * ctx.atr]
     pools.sort(key=lambda p: (p.price, p.side))
@@ -156,8 +187,15 @@ def find_pools(ctx) -> list[Pool]:
     for pool in pools:
         if merged and merged[-1].side == pool.side and abs(pool.price - merged[-1].price) <= max(0.5 * ctx.atr, 0.5):
             prev = merged[-1]
-            # Keep the stronger pool, but accumulate the touch count.
-            keep = pool if pool.touches > prev.touches else prev
+            # Keep the stronger pool, but accumulate the touch count. A session
+            # wall wins over a generic swing cluster: "伦敦时段高" tells the
+            # trader which session built it, "波段点" does not.
+            if prev.kind in SESSION_KINDS and pool.kind not in SESSION_KINDS:
+                keep = prev
+            elif pool.kind in SESSION_KINDS and prev.kind not in SESSION_KINDS:
+                keep = pool
+            else:
+                keep = pool if pool.touches > prev.touches else prev
             merged[-1] = Pool(
                 price=keep.price,
                 kind=keep.kind,

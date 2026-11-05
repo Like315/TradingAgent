@@ -92,6 +92,10 @@ def _opposing_pool(pools: list[Pool], setup_side: str, start: float, target: flo
     return max(blocking, key=lambda p: p.price) if blocking else None
 
 
+# Session pools (Asian/London/NY extremes) carry more stops than a lone swing.
+SESSION_KINDS = {"session_asian", "session_extreme"}
+
+
 def build_setups(
     ctx,
     bias: Bias,
@@ -101,6 +105,7 @@ def build_setups(
     equity: float,
     risk_pct: float,
     rejects: list[str] | None = None,
+    sessions=None,
 ) -> list[IctSetup]:
     """Setups that survive the 1H bias and the sweep arithmetic."""
     out: list[IctSetup] = []
@@ -169,11 +174,24 @@ def build_setups(
         position_bonus = (
             (1.0 - (bias.position_pct or 0.5)) if bias.direction == "long" else (bias.position_pct or 0.5)
         )
+        session_bonus = 0.1 if pool.kind in SESSION_KINDS else 0.0
+        kz = sessions.killzone if sessions is not None else None
+        kz_bonus = 0.1 if kz else 0.0
         score = (
-            0.4 * min(sweep.pool.touches, 3) / 3.0
-            + 0.3 * min(sweep.displacement_atr / 1.0, 1.0)
-            + 0.3 * max(0.0, min(1.0, position_bonus))
+            0.35 * min(sweep.pool.touches, 3) / 3.0
+            + 0.25 * min(sweep.displacement_atr / 1.0, 1.0)
+            + 0.25 * max(0.0, min(1.0, position_bonus))
+            + session_bonus
+            + kz_bonus
         )
+        if kz:
+            warnings.append(f"当前处于 {kz[1]}（SMC 入场窗口）")
+        elif sessions is not None and sessions.asian.complete:
+            warnings.append("非 killzone 时段：SMC 信号质量打折，SMC 传统上只在这三个窗口入场")
+        if pool.kind in SESSION_KINDS:
+            warnings.append("扫的是时段极值（亚洲/伦敦/纽约），止损密度高于普通波段点")
+        if bias.origin == "session":
+            warnings.append("方向来自 SMC session override（PO3），有效期到下一根 1H 收盘")
 
         why = (
             f"1H {bias.label}；{pool.label} {pool.price:,.2f} 被扫 "

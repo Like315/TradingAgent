@@ -19,9 +19,13 @@ from tradingagents.gold.intraday.clock import SHANGHAI
 from tradingagents.gold.intraday.levels import swings
 
 from tradingagents.gold.ict.liquidity import BUY_SIDE, SELL_SIDE, Pool, nearest
+from tradingagents.gold.ict.sessions import Sessions
 
 # The dealing range must span at least this many 15m-ATRs to mean anything.
 MIN_RANGE_ATR = 1.5
+# A session override (Judas swing already reclaimed) scores below a clean
+# structure+discount read, but above an unconfirmed wait.
+SESSION_OVERRIDE_SCORE = 0.55
 
 
 @dataclass
@@ -38,6 +42,8 @@ class Bias:
     score: float = 0.0
     reasons: list[str] = field(default_factory=list)
     valid_until: datetime | None = None
+    origin: str = "structure"  # structure | session — what authorised the side
+    sessions: Sessions | None = None
 
     @property
     def allowed(self) -> bool:
@@ -69,7 +75,59 @@ def _next_hour(now: datetime) -> datetime:
     return (local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
 
 
-def read_bias(ctx, pools: list[Pool] | None = None) -> Bias:
+def _session_wall(sessions: Sessions, direction: str) -> Pool | None:
+    """The wall the PO3 says price is drawn to: the untouched Asian side."""
+    asian = sessions.asian
+    if direction == "long" and asian.high is not None:
+        return Pool(price=asian.high, kind="session_asian", label="亚洲区间高（PO3 目标）", side=BUY_SIDE)
+    if direction == "short" and asian.low is not None:
+        return Pool(price=asian.low, kind="session_asian", label="亚洲区间低（PO3 目标）", side=SELL_SIDE)
+    return None
+
+
+def _session_override(ctx, sessions: Sessions, structure: str, position_pct: float, reasons: list[str]) -> str:
+    """The SMC exception: a reclaimed Asian sweep IS the entry it was blocking.
+
+    Normally "bullish structure but premium" means wait for discount. But in the
+    Power-of-Three the manipulation phase *is* the discount entry — London
+    drives price through the Asian low (that low is the day's deepest discount),
+    takes the stops, and the real move up starts from there. Blocking a long
+    here would be reading the range geometry while ignoring the event the range
+    exists to trap. The override requires the reclaim to be fresh: an old sweep
+    is history, not an entry.
+    """
+    m = sessions.manipulation
+    if not m.swept_side or not m.reclaimed:
+        return "none"
+    direction = m.expected_direction
+    if not direction:
+        return "none"
+    if m.bars_since > SESSION_OVERRIDE_MAX_BARS:
+        reasons.append(f"亚洲边扫单收回已 {m.bars_since} 根 15m（>{SESSION_OVERRIDE_MAX_BARS}），操纵阶段太旧，不做 session override")
+        return "none"
+    if structure == "bearish" and direction == "long":
+        reasons.append("1H 结构偏空且亚洲低点刚被扫：方向冲突，宁可错过")
+        return "none"
+    if structure == "bullish" and direction == "short":
+        reasons.append("1H 结构偏多且亚洲高点刚被扫：方向冲突，宁可错过")
+        return "none"
+
+    side_cn = "多" if direction == "long" else "空"
+    wall = "低点" if m.swept_side == "low" else "高点"
+    reasons.append(
+        f"Session override（SMC PO3）：{m.by_session} 时段扫亚洲{wall} {m.pierce_atr:.2f}×ATR 后收回，"
+        f"操纵完成、派发方向{'向上' if direction == 'long' else '向下'}，且与结构不冲突 → 允许做{side_cn}"
+    )
+    kz = sessions.killzone
+    if kz:
+        reasons.append(f"当前处于 {kz[1]}，SMC 入场窗口")
+    return direction
+
+
+SESSION_OVERRIDE_MAX_BARS = 8
+
+
+def read_bias(ctx, pools: list[Pool] | None = None, sessions: Sessions | None = None) -> Bias:
     """Classify the 1H frame. Pure function of the bars in ``ctx``."""
     points = swings(ctx.bars1h, k=2, lookback=96)
     structure, reasons = _structure(points)
@@ -83,10 +141,9 @@ def read_bias(ctx, pools: list[Pool] | None = None) -> Bias:
 
     high, low = max(last_high, last_low), min(last_high, last_low)
     span = high - low
-    if span < MIN_RANGE_ATR * ctx.atr:
-        reasons.append(f"1H dealing range 只有 {span:.2f} 美元（<{MIN_RANGE_ATR}×ATR），太窄不做")
-        return Bias(direction="none", structure=structure, label="区间过窄", dealing_low=low, dealing_high=high, reasons=reasons)
-
+    narrow = span < MIN_RANGE_ATR * ctx.atr
+    if narrow:
+        reasons.append(f"1H dealing range 只有 {span:.2f} 美元（<{MIN_RANGE_ATR}×ATR），结构信号本身不可用")
     position_pct = (ctx.price - low) / span
     position = "premium" if position_pct > 0.5 else ("discount" if position_pct < 0.5 else "equilibrium")
     reasons.append(
@@ -96,7 +153,10 @@ def read_bias(ctx, pools: list[Pool] | None = None) -> Bias:
     )
 
     direction = "none"
-    if structure == "bullish" and position_pct < 0.5:
+    if narrow:
+        pass  # a range too narrow to read cannot authorise a side — but a
+        # session override can: the PO3 defines the day without the 1H range.
+    elif structure == "bullish" and position_pct < 0.5:
         direction = "long"
     elif structure == "bearish" and position_pct > 0.5:
         direction = "short"
@@ -107,22 +167,50 @@ def read_bias(ctx, pools: list[Pool] | None = None) -> Bias:
     else:
         reasons.append("震荡结构：只做区间边缘的扫单，不做趋势单")
 
+    # SMC session layer: an Asian-range sweep reclaimed by London/NY is the
+    # manipulation phase completing — it authorises the direction even where
+    # the pure structure+premium/discount gate says wait.
+    origin = "structure"
+    if direction == "none" and sessions is not None:
+        override = _session_override(ctx, sessions, structure, position_pct, reasons)
+        if override != "none":
+            direction = override
+            origin = "session"
+
     draw = None
     draw_r = None
-    if direction in ("long", "short") and pools:
-        draw = nearest(pools, ctx.price, BUY_SIDE if direction == "long" else SELL_SIDE)
+    if direction in ("long", "short"):
+        # The PO3 target outranks a generic pool: after an Asian-low sweep the
+        # market is drawn to the Asian high, whatever else sits in between.
+        wall = _session_wall(sessions, direction) if sessions is not None else None
+        if wall is not None and ((direction == "long" and wall.price > ctx.price) or (direction == "short" and wall.price < ctx.price)):
+            draw = wall
+        elif pools:
+            draw = nearest(pools, ctx.price, BUY_SIDE if direction == "long" else SELL_SIDE)
         if draw is not None:
             draw_r = abs(draw.price - ctx.price) / ctx.atr
             reasons.append(f"流动性吸引（draw）：{draw.label} {draw.price:,.2f}，距现价 {draw_r:.2f}×ATR")
 
     score = 0.0
     if direction != "none":
-        score = 0.5
-        score += 0.3 * (1.0 - position_pct if direction == "long" else position_pct)
+        if origin == "session":
+            score = SESSION_OVERRIDE_SCORE
+            if sessions.manipulation.pierce_atr >= 0.3:
+                score += 0.15  # a decisive sweep, not a wick-graze
+        else:
+            score = 0.5
+            score += 0.3 * (1.0 - position_pct if direction == "long" else position_pct)
         if draw_r is not None and 1.0 <= draw_r <= 6.0:
             score += 0.2
+        if sessions is not None and sessions.killzone:
+            score += 0.05
 
-    label = {"long": "1H 偏多（折价区）", "short": "1H 偏空（溢价区）"}.get(direction, "1H 无方向")
+    if origin == "session":
+        label = f"SMC PO3 {'偏多' if direction == 'long' else '偏空'}（亚洲边扫单收回）"
+    elif direction == "none" and narrow:
+        label = "区间过窄"
+    else:
+        label = {"long": "1H 偏多（折价区）", "short": "1H 偏空（溢价区）"}.get(direction, "1H 无方向")
     return Bias(
         direction=direction,
         structure=structure,
@@ -136,4 +224,6 @@ def read_bias(ctx, pools: list[Pool] | None = None) -> Bias:
         score=round(score, 2),
         reasons=reasons,
         valid_until=_next_hour(ctx.now),
+        origin=origin,
+        sessions=sessions,
     )

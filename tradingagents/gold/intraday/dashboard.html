@@ -598,7 +598,23 @@ function renderICT(payload) {
     </div>`).join("")
     : `<div class="scenario" style="margin-top:8px"><div class="row" style="font-size:11.5px;color:var(--dim)">${d.rejects.slice(0, 2).map(r => "· " + esc(r)).join("<br>")}</div></div>`;
 
-  box.innerHTML = biasLine + range +
+  const sess = d.sessions;
+  const sessLine = sess ? (() => {
+    const kz = sess.killzone ? `<span class="badge watch" style="font-size:10px">${esc(sess.killzone.label)}</span>` : "";
+    const row = (r) => `<div class="vote-row"><span class="vname" style="min-width:52px">${esc(r.label.replace("时段", ""))}</span>
+      <span style="flex:1;font-size:11.5px">${r.high == null ? "—" : fmt(r.low) + " - " + fmt(r.high)}</span>
+      <span class="dim" style="font-size:11px">${esc(r.status)}</span></div>`;
+    const m = sess.manipulation;
+    const mLine = m && m.swept_side
+      ? `<div class="vote-row"><span class="vname" style="min-width:52px">PO3</span>
+           <span style="flex:1;font-size:11.5px">${esc(m.label)} · 扫深 ${m.pierce_atr}×ATR</span>
+           <span class="badge ${m.expected_direction === "long" ? "long" : m.expected_direction === "short" ? "short" : "watch"}" style="font-size:10px">${m.expected_direction === "long" ? "派发向上" : m.expected_direction === "short" ? "派发向下" : "未定"}</span></div>`
+      : `<div class="vote-row"><span class="vname" style="min-width:52px">PO3</span><span style="flex:1;font-size:11.5px" class="dim">${esc(sess.po3_phase)}</span></div>`;
+    return `<div class="dim" style="font-size:10.5px;letter-spacing:.15em;margin:10px 0 2px">SMC SESSIONS · 亚洲→伦敦→纽约 ${kz}</div>`
+      + row(sess.asian) + row(sess.london) + row(sess.new_york) + mLine;
+  })() : "";
+
+  box.innerHTML = biasLine + range + sessLine +
     `<div class="dim" style="font-size:10.5px;letter-spacing:.15em;margin:10px 0 2px">LIQUIDITY POOLS · 流动性池</div>` + pools +
     `<div class="dim" style="font-size:10.5px;letter-spacing:.15em;margin:10px 0 2px">SWEEP MONITOR · 15M 扫单</div>` + sweeps +
     `<div class="dim" style="font-size:10.5px;letter-spacing:.15em;margin:10px 0 2px">SWEEP ENTRY · 扫单入场</div>` + setups +

@@ -226,3 +226,160 @@ def test_opposing_pool_inside_one_point_two_r_blocks_the_trade():
     setups = build_setups(ctx, bias, [_long_sweep()], [blocker], equity=50_000, risk_pct=0.3, rejects=rejects)
     assert setups == []
     assert any("前方流动性" in reason for reason in rejects)
+
+
+# --------------------------------------------------------------------------- #
+# SMC session layer: Asian → London → NY, PO3, killzones
+# --------------------------------------------------------------------------- #
+
+from tradingagents.gold.ict.sessions import Manipulation, SessionRange, Sessions, compute_sessions, killzone
+from tradingagents.gold.ict.bias import read_bias
+
+from tradingagents.gold.intraday import feed
+
+SHANGHAI_TZ = feed.SHANGHAI
+
+
+def sessions_ctx(bars, *, now=None, atr=10.0, levels=None, price=None):
+    c = ctx_for(bars, atr=atr, levels=levels, price=price)
+    if now is not None:
+        c.now = now
+    return c
+
+
+def test_killzone_windows_follow_their_own_timezone():
+    # 10:30 Tokyo = Asian killzone
+    assert killzone(datetime(2026, 11, 4, 9, 30, tzinfo=SHANGHAI_TZ))[0] == "asian"
+    # 16:30 Beijing = 08:30/09:30 London (DST) → London killzone
+    assert killzone(datetime(2026, 11, 4, 16, 30, tzinfo=SHANGHAI_TZ))[0] == "london"
+    # 22:00 Beijing = 09:00/10:00 New York → NY killzone
+    assert killzone(datetime(2026, 11, 4, 22, 0, tzinfo=SHANGHAI_TZ))[0] == "new_york"
+    # 14:00 Beijing = Tokyo lunch, London pre-open, NY asleep → nothing
+    assert killzone(datetime(2026, 11, 4, 14, 0, tzinfo=SHANGHAI_TZ)) is None
+
+
+def _session_bars():
+    """One trading day: flat Asia, London dips below the Asian low then reclaims.
+
+    The Globex day opens 18:00 ET on Nov 3 (= 06:00/07:00 Beijing Nov 4) and
+    runs to 17:00 ET Nov 4. Bars are hourly-ish 15m rows built per phase.
+    """
+    idx = pd.date_range("2026-11-04 06:00", periods=64, freq="15min")  # through 22:00 Beijing
+    rows = []
+    for ts in idx:
+        hour = ts.hour + ts.minute / 60
+        if hour < 10.0:  # Asia: flat 4000
+            px = 4000.0
+        elif hour < 16.0:  # between Asia end (london open 16:00) boundary slop: keep flat
+            px = 4000.0
+        elif hour < 18.0:  # London: sweep the Asian low (3996) then reclaim
+            px = 3994.0 if ts.minute == 0 else 4000.0
+        else:  # NY: distribution up
+            px = 4004.0
+        rows.append({"open": px, "high": px + 1.0, "low": px - 1.0, "close": px, "volume": 10.0})
+    return pd.DataFrame(rows, index=idx)
+
+
+def test_sessions_compute_asian_london_ny_ranges():
+    bars = _session_bars()
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 22, 0, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    assert s.asian.high is not None and s.asian.complete
+    assert s.london.high is not None
+    assert s.new_york.high is not None and not s.new_york.complete
+    # Asian range is the flat 4000 block (±1 pad)
+    assert 3999.0 <= s.asian.low <= 4001.0
+    assert 3999.0 <= s.asian.high <= 4001.5
+
+
+def test_london_sweep_of_asian_low_is_detected_as_manipulation():
+    bars = _session_bars()
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 22, 0, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    m = s.manipulation
+    assert m.swept_side == "low"
+    assert m.reclaimed
+    assert m.by_session == "london"
+    assert m.expected_direction == "long"
+    assert "向上" in s.po3_phase or "派发" in s.po3_phase
+
+
+def test_no_london_sweep_means_no_manipulation():
+    idx = pd.date_range("2026-11-04 06:00", periods=40, freq="15min")
+    rows = [{"open": 4000.0, "high": 4000.8, "low": 3999.2, "close": 4000.0, "volume": 10.0}] * len(idx)
+    ctx = sessions_ctx(pd.DataFrame(rows, index=idx), now=datetime(2026, 11, 4, 16, 30, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    assert s.manipulation.swept_side == ""
+    assert "等操纵" in s.po3_phase or "积累" in s.po3_phase
+
+
+def test_session_override_grants_long_in_premium_after_asian_low_sweep():
+    bars = _session_bars().iloc[:46]  # cut at 17:30: the reclaim is still fresh
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 17, 30, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    # 1H structure bullish (rising closes) but price at the top of its dealing
+    # range → the pure gate says "wait in premium". The reclaimed Asian-low
+    # sweep must override that.
+    points = [("high", 3990.0, "a"), ("low", 3980.0, "b"), ("high", 3995.0, "c"), ("low", 3985.0, "d")]
+    ctx.points = points
+    import tradingagents.gold.ict.bias as bias_mod
+
+    original = bias_mod.swings
+    bias_mod.swings = lambda *a, **k: points
+    try:
+        bias = read_bias(ctx, pools=[], sessions=s)
+    finally:
+        bias_mod.swings = original
+    assert bias.direction == "long"
+    assert bias.origin == "session"
+    assert any("Session override" in r for r in bias.reasons)
+    # The draw is the untouched Asian high, not a generic pool
+    assert bias.draw is not None and bias.draw.kind == "session_asian"
+
+
+def test_session_override_does_not_fight_a_conflicting_structure():
+    bars = _session_bars().iloc[:46]
+    # price parked in discount so the bearish structure alone cannot authorise
+    # the short — only the refused override is under test here
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 17, 30, tzinfo=SHANGHAI_TZ), price=3992.0)
+    s = compute_sessions(ctx)
+    points = [("high", 4020.0, "a"), ("low", 4000.0, "b"), ("high", 4010.0, "c"), ("low", 3990.0, "d")]
+    import tradingagents.gold.ict.bias as bias_mod
+
+    original = bias_mod.swings
+    bias_mod.swings = lambda *a, **k: points
+    try:
+        bias = read_bias(ctx, pools=[], sessions=s)
+    finally:
+        bias_mod.swings = original
+    # Bearish structure vs an upward PO3: the override must refuse.
+    assert bias.direction == "none"
+
+
+def test_stale_manipulation_is_not_an_override():
+    bars = _session_bars()
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 22, 0, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    s.manipulation.bars_since = 50  # ~12 hours ago
+    import tradingagents.gold.ict.bias as bias_mod
+
+    points = [("high", 3990.0, "a"), ("low", 3980.0, "b"), ("high", 3995.0, "c"), ("low", 3985.0, "d")]
+    original = bias_mod.swings
+    bias_mod.swings = lambda *a, **k: points
+    try:
+        bias = read_bias(ctx, pools=[], sessions=s)
+    finally:
+        bias_mod.swings = original
+    assert bias.direction == "none"
+    assert any("太旧" in r for r in bias.reasons)
+
+
+def test_session_extremes_enter_the_pool_inventory():
+    bars = _session_bars()
+    ctx = sessions_ctx(bars, now=datetime(2026, 11, 4, 22, 0, tzinfo=SHANGHAI_TZ))
+    s = compute_sessions(ctx)
+    pools = find_pools(ctx, s)
+    labels = " ".join(p.label for p in pools)
+    assert "伦敦" in labels and "纽约" in labels
+    kinds = {p.kind for p in pools}
+    assert "session_extreme" in kinds

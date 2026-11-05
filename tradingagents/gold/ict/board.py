@@ -23,6 +23,7 @@ from tradingagents.gold.ict.bias import Bias, read_bias
 from tradingagents.gold.ict.context import MarketContext, build_context
 from tradingagents.gold.ict.entry import FIXED_RR, IctSetup, build_setups
 from tradingagents.gold.ict.liquidity import BUY_SIDE, SELL_SIDE, Pool, Sweep, find_pools, find_sweeps
+from tradingagents.gold.ict.sessions import Sessions, compute_sessions
 
 _UP = "bold red"
 _DOWN = "bold green"
@@ -35,6 +36,7 @@ class IctBoard:
     pools: list[Pool]
     sweeps: list[Sweep]
     setups: list[IctSetup]
+    sessions: Sessions
     rejects: list[str] = field(default_factory=list)
     freshness_blocker: str = ""
 
@@ -54,7 +56,8 @@ class IctBoard:
             return "数据过期，不给信号"
         if self.setups:
             return f"可执行 · {self.setups[0].pool.label}"
-        return f"{self.bias.label} · 等扫单"
+        po3 = self.sessions.po3_phase
+        return f"{self.bias.label} · {po3}"
 
     # -- machine ---------------------------------------------------------- #
 
@@ -91,7 +94,9 @@ class IctBoard:
                 else {"label": bias.draw.label, "price": bias.draw.price, "r": round(bias.draw_r or 0.0, 2)},
                 "reasons": bias.reasons,
                 "valid_until": bias.valid_until.isoformat() if bias.valid_until else None,
+                "origin": bias.origin,
             },
+            "sessions": self.sessions.to_dict(),
             "pools": [
                 {
                     "label": p.label,
@@ -171,6 +176,23 @@ class IctBoard:
         for reason in bias.reasons:
             lines.append(f"  · {reason}")
 
+        s = self.sessions
+        lines += ["", "--- SMC 时段（亚洲→伦敦→纽约）---"]
+        for rng in (s.asian, s.london, s.new_york):
+            span = "—" if rng.high is None else f"{rng.low:,.2f}-{rng.high:,.2f}"
+            lines.append(f"  {rng.label}：{span}（{rng.status}）")
+        lines.append(f"  PO3：{s.po3_phase}")
+        m = s.manipulation
+        if m.swept_side:
+            lines.append(
+                f"  操纵：{m.label}，极值 {m.extreme:,.2f}，扫深 {m.pierce_atr:.2f}×ATR，{m.bars_since} 根前"
+                + (f"，派发方向{'向上' if m.expected_direction == 'long' else '向下'}" if m.expected_direction else "")
+            )
+        if s.killzone:
+            lines.append(f"  Killzone：{s.killzone[1]}")
+        for note in s.notes:
+            lines.append(f"  · {note}")
+
         lines += ["", "--- 流动性池（按距现价排序）---"]
         for pool in sorted(self.pools, key=lambda p: abs(p.price - self.price))[:10]:
             lines.append(
@@ -208,6 +230,7 @@ class IctBoard:
         console = console or Console()
         console.print(self._header())
         console.print(self._bias_panel())
+        console.print(self._sessions_panel())
         console.print(self._pool_table())
         console.print(self._sweep_table())
         for setup in self.setups:
@@ -249,6 +272,26 @@ class IctBoard:
         for reason in bias.reasons:
             table.add_row("·", f"[dim]{reason}[/]")
         return Panel(table, title="[bold]1H 偏置[/bold]", border_style="bright_black", title_align="left")
+
+    def _sessions_panel(self) -> Panel:
+        s = self.sessions
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        for rng in (s.asian, s.london, s.new_york):
+            span = "—" if rng.high is None else f"{rng.low:,.2f} - {rng.high:,.2f}"
+            table.add_row(rng.label, f"{span}　[dim]{rng.status}[/dim]")
+        table.add_row("PO3 阶段", s.po3_phase)
+        m = s.manipulation
+        if m.swept_side:
+            extreme = f"　极值 {m.extreme:,.2f}　扫深 {m.pierce_atr:.2f}×ATR" if m.extreme else ""
+            table.add_row("操纵记录", f"{m.label}{extreme}　{m.bars_since} 根前")
+            if m.expected_direction:
+                side_cn = "向上" if m.expected_direction == "long" else "向下"
+                table.add_row("派发方向", side_cn)
+        if s.killzone:
+            table.add_row("Killzone", f"[cyan]{s.killzone[1]}[/cyan]")
+        for note in s.notes:
+            table.add_row("·", f"[dim]{note}[/dim]")
+        return Panel(table, title="[bold]SMC 时段（亚洲→伦敦→纽约）[/bold]", border_style="bright_black", title_align="left")
 
     def _pool_table(self) -> Panel:
         table = Table(box=None, padding=(0, 1), header_style="bold")
@@ -317,8 +360,9 @@ def build_ict_board(
     fresh: bool = False,
 ) -> IctBoard:
     ctx = build_context(now=now, fresh=fresh)
-    pools = find_pools(ctx)
-    bias = read_bias(ctx, pools)
+    sessions = compute_sessions(ctx)
+    pools = find_pools(ctx, sessions)
+    bias = read_bias(ctx, pools, sessions)
     sweeps = find_sweeps(ctx, pools)
 
     # Same rule as the scalp board: a stale price inside an open session is
@@ -330,6 +374,15 @@ def build_ict_board(
     setups = (
         []
         if blocker
-        else build_setups(ctx, bias, sweeps, pools, equity=equity, risk_pct=risk_pct, rejects=rejects)
+        else build_setups(ctx, bias, sweeps, pools, equity=equity, risk_pct=risk_pct, rejects=rejects, sessions=sessions)
     )
-    return IctBoard(ctx=ctx, bias=bias, pools=pools, sweeps=sweeps, setups=setups, rejects=rejects, freshness_blocker=blocker)
+    return IctBoard(
+        ctx=ctx,
+        bias=bias,
+        pools=pools,
+        sweeps=sweeps,
+        setups=setups,
+        sessions=sessions,
+        rejects=rejects,
+        freshness_blocker=blocker,
+    )
